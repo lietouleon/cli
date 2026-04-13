@@ -684,6 +684,19 @@ func checkShortcutScopes(f *cmdutil.Factory, ctx context.Context, as core.Identi
 		fmt.Sprintf("run `lark-cli auth login --scope \"%s\"` in the background. It blocks and outputs a verification URL — retrieve the URL and open it in a browser to complete login.", strings.Join(missing, " ")))
 }
 
+// RequireScopes runs an extra scope-prerequisite check at runtime so a shortcut
+// can demand a scope only when a code path actually needs it (e.g. an
+// upload-only scope when the user passes an `@./path` placeholder). Use this
+// from Validate when the requirement depends on inputs — declaring everything
+// up-front in Shortcut.Scopes would force every caller to grant scopes for
+// branches they never hit.
+func (ctx *RuntimeContext) RequireScopes(scopes ...string) error {
+	if len(scopes) == 0 {
+		return nil
+	}
+	return checkShortcutScopes(ctx.Factory, ctx.ctx, ctx.As(), ctx.Config, scopes)
+}
+
 func newRuntimeContext(cmd *cobra.Command, f *cmdutil.Factory, s *Shortcut, config *core.CliConfig, as core.Identity, botOnly bool) (*RuntimeContext, error) {
 	ctx := cmd.Context()
 	ctx = cmdutil.ContextWithShortcut(ctx, s.Service+":"+s.Command, uuid.New().String())

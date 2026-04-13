@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/larksuite/cli/internal/output"
@@ -27,10 +28,13 @@ var SlidesCreate = common.Shortcut{
 	Description: "Create a Lark Slides presentation",
 	Risk:        "write",
 	AuthTypes:   []string{"user", "bot"},
-	Scopes:      []string{"slides:presentation:create", "slides:presentation:write_only"},
+	// docs:document.media:upload is only needed when --slides contains <img src="@./...">
+	// placeholders; that requirement is checked at runtime via RequireScopes in Validate
+	// so text-only callers don't have to grant an upload scope they never use.
+	Scopes: []string{"slides:presentation:create", "slides:presentation:write_only"},
 	Flags: []common.Flag{
 		{Name: "title", Desc: "presentation title"},
-		{Name: "slides", Desc: "slide content JSON array (each element is a <slide> XML string, max 10; for more pages, create first then add via xml_presentation.slide.create)"},
+		{Name: "slides", Desc: "slide content JSON array (each element is a <slide> XML string, max 10; for more pages, create first then add via xml_presentation.slide.create). <img src=\"@./local.png\"> placeholders are auto-uploaded and replaced with file_token."},
 	},
 	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		if slidesStr := runtime.Str("slides"); slidesStr != "" {
@@ -40,6 +44,26 @@ var SlidesCreate = common.Shortcut{
 			}
 			if len(slides) > maxSlidesPerCreate {
 				return common.FlagErrorf("--slides array exceeds maximum of %d slides; create the presentation first, then add slides via xml_presentation.slide.create", maxSlidesPerCreate)
+			}
+			// Validate placeholder paths up front so we don't create a presentation
+			// only to fail mid-way on a missing local file. Same fail-fast intent
+			// applies to the upload scope: if @path is present we must require
+			// docs:document.media:upload now, otherwise create succeeds in step 1
+			// and the in-flight upload 403s, leaving an orphaned empty PPT.
+			placeholders := extractImagePlaceholderPaths(slides)
+			if len(placeholders) > 0 {
+				if err := runtime.RequireScopes("docs:document.media:upload"); err != nil {
+					return err
+				}
+			}
+			for _, path := range placeholders {
+				stat, err := runtime.FileIO().Stat(path)
+				if err != nil {
+					return common.WrapInputStatError(err, fmt.Sprintf("--slides @%s: file not found", path))
+				}
+				if !stat.Mode().IsRegular() {
+					return common.FlagErrorf("--slides @%s: must be a regular file", path)
+				}
 			}
 		}
 		return nil
@@ -61,16 +85,32 @@ var SlidesCreate = common.Shortcut{
 			var slides []string
 			_ = json.Unmarshal([]byte(slidesStr), &slides)
 			n := len(slides)
-			total := n + 1
+			placeholders := extractImagePlaceholderPaths(slides)
+			total := n + 1 + len(placeholders)
 
-			dry.Desc(fmt.Sprintf("Create presentation + add %d slide(s)", n)).
+			descSuffix := ""
+			if len(placeholders) > 0 {
+				descSuffix = fmt.Sprintf(" + upload %d image(s)", len(placeholders))
+			}
+			dry.Desc(fmt.Sprintf("Create presentation%s + add %d slide(s)", descSuffix, n)).
 				POST("/open-apis/slides_ai/v1/xml_presentations").
 				Desc(fmt.Sprintf("[1/%d] Create presentation", total)).
 				Body(createBody)
 
+			// Upload steps come right after creation so they can use the new
+			// presentation_id as parent_node.
+			for i, path := range placeholders {
+				appendSlidesUploadDryRun(dry, runtime.FileIO(), path, "<xml_presentation_id>", i+2)
+			}
+
+			slideStepStart := 2 + len(placeholders)
+			slideDescSuffix := ""
+			if len(placeholders) > 0 {
+				slideDescSuffix = " (img placeholders auto-replaced)"
+			}
 			for i, slideXML := range slides {
 				dry.POST("/open-apis/slides_ai/v1/xml_presentations/<xml_presentation_id>/slide").
-					Desc(fmt.Sprintf("[%d/%d] Add slide %d", i+2, total, i+1)).
+					Desc(fmt.Sprintf("[%d/%d] Add slide %d%s", slideStepStart+i, total, i+1, slideDescSuffix)).
 					Body(map[string]interface{}{
 						"slide": map[string]interface{}{"content": slideXML},
 					})
@@ -121,6 +161,23 @@ var SlidesCreate = common.Shortcut{
 			_ = json.Unmarshal([]byte(slidesStr), &slides) // already validated
 
 			if len(slides) > 0 {
+				// Step 1.5: Upload any @path placeholders, then rewrite slide XML
+				// with the resulting file_tokens. Uploads run after creation so
+				// they can use the new presentation_id as parent_node.
+				placeholders := extractImagePlaceholderPaths(slides)
+				if len(placeholders) > 0 {
+					tokens, uploaded, err := uploadSlidesPlaceholders(runtime, presentationID, placeholders)
+					if err != nil {
+						return output.Errorf(output.ExitAPI, "api_error",
+							"image upload failed: %v (presentation %s was created; %d image(s) uploaded before failure)",
+							err, presentationID, uploaded)
+					}
+					for i := range slides {
+						slides[i] = replaceImagePlaceholders(slides[i], tokens)
+					}
+					result["images_uploaded"] = uploaded
+				}
+
 				slideURL := fmt.Sprintf(
 					"/open-apis/slides_ai/v1/xml_presentations/%s/slide",
 					validate.EncodePathSegment(presentationID),
@@ -203,6 +260,33 @@ func buildPresentationXML(title string) string {
 		`<presentation xmlns="http://www.larkoffice.com/sml/2.0" width="%d" height="%d"><title>%s</title></presentation>`,
 		defaultPresentationWidth, defaultPresentationHeight, escapedTitle,
 	)
+}
+
+// uploadSlidesPlaceholders uploads each unique placeholder path against the
+// presentation and returns the path→file_token map. The second return value is
+// the number of files successfully uploaded before any error, so callers can
+// surface progress in the failure message.
+func uploadSlidesPlaceholders(runtime *common.RuntimeContext, presentationID string, paths []string) (map[string]string, int, error) {
+	tokens := make(map[string]string, len(paths))
+	for i, path := range paths {
+		stat, err := runtime.FileIO().Stat(path)
+		if err != nil {
+			return tokens, i, common.WrapInputStatError(err, fmt.Sprintf("@%s: file not found", path))
+		}
+		if !stat.Mode().IsRegular() {
+			return tokens, i, output.ErrValidation("@%s: must be a regular file", path)
+		}
+		fileName := filepath.Base(path)
+		fmt.Fprintf(runtime.IO().ErrOut, "Uploading image %d/%d: %s (%s)\n",
+			i+1, len(paths), fileName, common.FormatSize(stat.Size()))
+
+		token, err := uploadSlidesMedia(runtime, path, fileName, stat.Size(), presentationID)
+		if err != nil {
+			return tokens, i, fmt.Errorf("@%s: %w", path, err)
+		}
+		tokens[path] = token
+	}
+	return tokens, len(paths), nil
 }
 
 // xmlEscape escapes special XML characters in text content.
